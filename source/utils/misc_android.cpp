@@ -16,12 +16,14 @@
 
 #include "misc_android.h"
 #include "utils/misc.h"
+#include <cstdio>
 #include <cstring>
 #include <dirent.h>
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <sys/system_properties.h>
 #include <sys/wait.h>
+#include <unordered_map>
 #include <unistd.h>
 #include <vector>
 
@@ -112,6 +114,56 @@ std::string GetTopAppNameDumpsys(void) {
         return GetTopAppNameDumpsysAndroid7(); // took ~100ms
     }
     return {};
+}
+
+// Identify the foreground app from the tasks of the top-app cpuset, by voting
+// on the base process name read from /proc/<tid>/cmdline.
+// App processes forked from zygote carry the package name as cmdline, and
+// "pkg:sub" processes share the same base name, so the foreground app wins
+// the vote in most cases. Cost is a few tiny /proc reads (<1ms), which is
+// far cheaper than dumpsys (~40ms), so it can run on every tasklist change.
+std::string GetTopAppNameProc(const std::vector<int> &pids) {
+    constexpr size_t MAX_SCAN_TASKS = 64;
+    constexpr size_t CMDLINE_MAX_LEN = 256;
+
+    std::unordered_map<std::string, int> votes;
+    std::unordered_map<std::string, int> exact;
+    size_t scanned = 0;
+    for (auto pid : pids) {
+        if (scanned >= MAX_SCAN_TASKS) {
+            break;
+        }
+        char path[64];
+        snprintf(path, sizeof(path), "/proc/%d/cmdline", pid);
+        std::string buf;
+        if (ReadFile(path, &buf, CMDLINE_MAX_LEN) <= 0) {
+            continue;
+        }
+        ++scanned;
+
+        std::string name = buf.c_str(); // stop at the first '\0'
+        if (name.empty() || name.find('/') != std::string::npos) {
+            continue; // skip native executables
+        }
+        auto base = name.substr(0, name.find(':'));
+        votes[base]++;
+        if (base.size() == name.size()) {
+            exact[base]++; // seen as a main process, prefer it on tie
+        }
+    }
+
+    std::string top;
+    int topVotes = 0;
+    int topExact = 0;
+    for (const auto &[name, cnt] : votes) {
+        auto ex = exact[name];
+        if (cnt > topVotes || (cnt == topVotes && ex > topExact)) {
+            top = name;
+            topVotes = cnt;
+            topExact = ex;
+        }
+    }
+    return top;
 }
 
 std::string GetHomePackageName(void) {

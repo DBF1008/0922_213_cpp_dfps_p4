@@ -17,9 +17,11 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 int GetOSVersion(void);
 std::string GetTopAppNameDumpsys(void);
+std::string GetTopAppNameProc(const std::vector<int> &pids);
 std::string GetHomePackageName(void);
 std::string GetTombstone(int pid);
 int GetScreenBrightness(void);

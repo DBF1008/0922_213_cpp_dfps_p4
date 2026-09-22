@@ -19,6 +19,7 @@
 #include "cobridge_type.h"
 #include "platform/module_base.h"
 #include "utils/time_counter.h"
+#include <mutex>
 
 class TopappMonitor : public ModuleBase {
 public:
@@ -28,9 +29,15 @@ public:
 
 private:
     void OnTopappList(const void *data);
+    void IdentifyByProc(void);
+    void ScheduleDumpsysConfirm(void);
+    bool PublishPkgNameIfChanged(const std::string &pkgName);
 
-    int topappNr_;
+    PidSet prevTasks_;
     std::string prevPkgName_;
+    std::mutex pkgMut_;
+    TimeCounter dumpsysTm_;
     HeavyWorker::Handle hw_;
-    DelayedWorker::Handle dw_;
+    DelayedWorker::Handle dwProc_;
+    DelayedWorker::Handle dwDumpsys_;
 };
