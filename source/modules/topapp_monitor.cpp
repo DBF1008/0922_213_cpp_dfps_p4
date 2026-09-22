@@ -18,13 +18,18 @@
 #include "utils/atrace.h"
 #include "utils/misc.h"
 #include "utils/misc_android.h"
+#include <algorithm>
+#include <cstdio>
 #include <spdlog/spdlog.h>
 
 constexpr char MODULE_NAME[] = "TopappMonitor";
 constexpr int64_t TOP_APP_SWITCH_DELAY_MS = 800;
-constexpr size_t TOP_TASK_NR_DIFF_MIN = 10;
+constexpr int64_t SCAN_MIN_INTERVAL_MS = 200;
+constexpr size_t SCAN_TASKS_MAX = 512;
+constexpr size_t PROC_CMDLINE_MAX_LEN = 256;
 
-TopappMonitor::TopappMonitor() : topappNr_(0), hw_(HwCreate(MODULE_NAME)), dw_(DwCreate(MODULE_NAME)) {}
+TopappMonitor::TopappMonitor()
+    : hwScan_(HwCreate(MODULE_NAME)), hwQuery_(HwCreate(MODULE_NAME)), dw_(DwCreate(MODULE_NAME)) {}
 
 TopappMonitor::~TopappMonitor() {}
 
@@ -38,27 +43,64 @@ void TopappMonitor::OnTopappList(const void *data) {
         return;
     }
 
-    const auto &pl = CoBridge::Get<PidList>(data);
-    auto nr = static_cast<int>(pl.size());
-    if (std::abs(nr - topappNr_) <= TOP_TASK_NR_DIFF_MIN) {
+    // HeavyWorker coalesces pending work per handle, so bursts of cgroup
+    // events collapse into one scan on the low-priority worker thread
+    PidList snapshot = CoBridge::Get<PidList>(data);
+    HwSetWork(hwScan_, [this, snapshot]() { ScanAndTrigger(snapshot); });
+}
+
+static std::string ReadProcName(int pid) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/cmdline", pid);
+    std::string buf;
+    if (ReadFile(path, &buf, PROC_CMDLINE_MAX_LEN) <= 0) {
+        return {};
+    }
+    return buf.substr(0, buf.find('\0'));
+}
+
+void TopappMonitor::ScanAndTrigger(const PidList &pl) {
+    // rate-limit /proc scans, the delayed query below is coalesced anyway
+    if (scanTimer_.ElapsedMs() < SCAN_MIN_INTERVAL_MS) {
         return;
     }
-    topappNr_ = nr;
+    scanTimer_.Reset();
 
-    auto delayed = [this]() {
-        auto heavywork = [this]() {
-            ATRACE_SCOPE(GetTopAppName);
-            auto pkgName = GetTopAppNameDumpsys();
-            if (pkgName.empty()) {
-                return;
-            }
-            if (pkgName != prevPkgName_) {
-                prevPkgName_ = pkgName;
-                SPDLOG_DEBUG("topapp.pkgName {}", pkgName);
-                CoPublish("topapp.pkgName", &pkgName);
-            }
-        };
-        HwSetWork(hw_, heavywork);
-    };
+    // threads share the cmdline of their process, so the distinct cmdline
+    // set of the top-app cpuset is the set of foreground processes;
+    // an app switch always changes this set, even when the two apps have
+    // a similar number of threads
+    std::set<std::string> procNames;
+    auto nr = std::min(pl.size(), SCAN_TASKS_MAX);
+    for (size_t i = 0; i < nr; ++i) {
+        auto name = ReadProcName(pl[i]);
+        if (name.empty() == false) {
+            procNames.insert(std::move(name));
+        }
+    }
+
+    if (policy_.OnTopappTasks(procNames, static_cast<int>(pl.size()))) {
+        ScheduleQuery();
+    }
+}
+
+void TopappMonitor::ScheduleQuery(void) {
+    auto delayed = [this]() { HwSetWork(hwQuery_, [this]() { QueryTopapp(); }); };
     DwSetWork(dw_, delayed, GetNowTs() + MsToUs(TOP_APP_SWITCH_DELAY_MS));
+}
+
+void TopappMonitor::QueryTopapp(void) {
+    ATRACE_SCOPE(GetTopAppName);
+    auto pkgName = GetTopAppNameDumpsys();
+    bool changed = (pkgName.empty() == false) && (pkgName != prevPkgName_);
+    if (changed) {
+        prevPkgName_ = pkgName;
+        SPDLOG_DEBUG("topapp.pkgName {}", pkgName);
+        CoPublish("topapp.pkgName", &pkgName);
+    }
+    // the query may have run before ActivityManager settled the new top
+    // activity; re-check a bounded number of times when a switch was expected
+    if (policy_.OnQueryResult(changed)) {
+        ScheduleQuery();
+    }
 }

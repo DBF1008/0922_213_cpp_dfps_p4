@@ -18,6 +18,7 @@
 
 #include "cobridge_type.h"
 #include "platform/module_base.h"
+#include "topapp_policy.h"
 #include "utils/time_counter.h"
 
 class TopappMonitor : public ModuleBase {
@@ -28,9 +29,14 @@ public:
 
 private:
     void OnTopappList(const void *data);
+    void ScanAndTrigger(const PidList &pl);
+    void ScheduleQuery(void);
+    void QueryTopapp(void);
 
-    int topappNr_;
+    TopappQueryPolicy policy_;
+    TimeCounter scanTimer_;
     std::string prevPkgName_;
-    HeavyWorker::Handle hw_;
+    HeavyWorker::Handle hwScan_;
+    HeavyWorker::Handle hwQuery_;
     DelayedWorker::Handle dw_;
 };
